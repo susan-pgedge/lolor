@@ -6,7 +6,7 @@ EXTENSION = lolor
 DATA = lolor--1.0.sql
 PGFILEDESC = "lolor - drop in large objects replacement for logical replication"
 
-OBJS = src/lolor.o src/lolor_fsstubs.o src/lolor_inv_api.o src/lolor_largeobject.o
+OBJS = src/lolor.o
 REGRESS = lolor
 
 ifdef USE_PGXS

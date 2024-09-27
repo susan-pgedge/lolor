@@ -24,6 +24,7 @@
 #include "nodes/value.h"
 #include "nodes/print.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/lsyscache.h"
@@ -33,67 +34,18 @@
 PG_MODULE_MAGIC;
 
 int32 lolor_node_id = 0;
+/*
+ * Parameters to determine when to emit a log message in
+ * LOLOR_GetNewOidWithIndex()
+ */
+#define GETNEWOID_LOG_THRESHOLD 1000000
+#define GETNEWOID_LOG_MAX_INTERVAL 128000000
+
+/* Parameters to determine new unique Oid. */
+#define MAX_NODEID_BITS 4
+#define MAX_OID_BITS 28
 
 void	_PG_init(void);
-
-/* keep Oids of the large object catalog. */
-Oid	LOLOR_LargeObjectRelationId = InvalidOid;
-Oid	LOLOR_LargeObjectLOidPNIndexId = InvalidOid;
-Oid	LOLOR_LargeObjectMetadataRelationId = InvalidOid;
-Oid	LOLOR_LargeObjectMetadataOidIndexId = InvalidOid;
-
-PG_FUNCTION_INFO_V1(lolor_on_drop_extension);
-
-Oid
-get_lobj_table_oid(const char *table)
-{
-	Oid			reloid;
-	Oid			nspoid;
-
-	nspoid = get_namespace_oid(EXTENSION_NAME, false);
-	reloid = get_relname_relid(table, nspoid);
-	if (reloid == InvalidOid)
-		elog(ERROR, "cache lookup failed for relation %s.%s",
-			 EXTENSION_NAME, table);
-
-	return reloid;
-}
-
-static void
-lolor_xact_callback(XactEvent event, void *arg)
-{
-	switch (event)
-	{
-		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-		case XACT_EVENT_PREPARE:
-			AtEOXact_LOLOR_LargeObject(true);
-			break;
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
-			AtEOXact_LOLOR_LargeObject(false);
-			break;
-		default:
-			break;
-	}
-}
-
-static void
-lolor_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
-						 SubTransactionId parentSubid, void *arg)
-{
-	switch (event)
-	{
-		case SUBXACT_EVENT_COMMIT_SUB:
-			AtEOSubXact_LOLOR_LargeObject(true, mySubid, parentSubid);
-			break;
-		case SUBXACT_EVENT_ABORT_SUB:
-			AtEOSubXact_LOLOR_LargeObject(false, mySubid, parentSubid);
-			break;
-		default:
-			break;
-	}
-}
 
 /*
  * Entry point for this module.
@@ -111,199 +63,110 @@ _PG_init(void)
 							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
-
-	/* gather info of large object tables from lolor extension */
-	LOLOR_LargeObjectRelationId =
-			get_lobj_table_oid(LOLOR_LARGEOBJECT_CATALOG);
-	LOLOR_LargeObjectLOidPNIndexId =
-			get_lobj_table_oid(LOLOR_LARGEOBJECT_PKEY);
-	LOLOR_LargeObjectMetadataRelationId =
-			get_lobj_table_oid(LOLOR_LARGEOBJECT_METADATA);
-	LOLOR_LargeObjectMetadataOidIndexId =
-			get_lobj_table_oid(LOLOR_LARGEOBJECT_METADATA_PKEY);
-
-	/* register transaction callbacks for cleanup. */
-	RegisterXactCallback(lolor_xact_callback, NULL);
-	RegisterSubXactCallback(lolor_subxact_callback, NULL);
 }
 
 /*
- * lolor_on_drop_extension
+ * LOLOR_GetNewOidWithIndex
+ *		Generate a new OID that is unique within the given relation.
  *
- * 	In order to be a drop-in replacement for the PostgreSQL built
- * 	in large object access functions, we must replace them with
- * 	our own ones. We do that in the extension's install script
- * 	by renaming the build-in ones to <funcname>_orig and then
- * 	creating our versions of them. The PostgreSQL system has no
- * 	mechanism to invoke a cleanup or uninstall script on DROP
- * 	EXTENSION. We therefore must do the cleanup in an event trigger.
- *	However only C-Language event triggers that fire on
- *	ddl_command_start have access to the list of object that get
- *	dropped.
+ * The lower 4 bits contains the lolor_node_id. The 2^28 bits consist of Oid
+ * returned from GetNewObjectId and adjusted to remain within the range.
  *
- *	We cannot drop our own functions here as the dependencies of
- *	the extension itself won't allow that. Likewise we cannot
- *	drop the origial PostgreSQL functions because the PostgreSQL
- *	system depends on them. But we can get around that with
- *	renaming (which makes no sense).
+ * See comments for GetNewOidWithIndex() for more details.
  */
-Datum
-lolor_on_drop_extension(PG_FUNCTION_ARGS)
+Oid
+LOLOR_GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
-	EventTriggerData   *trigdata;
-	DropStmt		   *dropstmt;
-	ListCell		   *lc;
-	bool				has_lolor_objs = false;
+	Oid			newOid;
+	SysScanDesc scan;
+	ScanKeyData key;
+	bool		collides;
+	uint64		retries = 0;
+	uint64		retries_before_log = GETNEWOID_LOG_THRESHOLD;
 
-	/* Make sure we are called as an event trigger */
-	if (!CALLED_AS_EVENT_TRIGGER(fcinfo))
-		elog(ERROR, "not fired by event trigger manager");
+	/* Check that GUC lolor.node is set */
+	if (lolor_node_id == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIG_FILE_ERROR),
+				 errmsg("value for lolor.node is not set")));
 
-	/* Make sure we have a parsetree and that this is for a DROP EXTENSION */
-	trigdata = (EventTriggerData *) fcinfo->context;
-	if (trigdata->parsetree == NULL)
+	/* Generate new OIDs until we find one not in the table */
+	do
 	{
-		elog(LOG, "lo_on_drop_extension(): parsetree = NULL");
-		PG_RETURN_NULL();
-	}
+		CHECK_FOR_INTERRUPTS();
 
-	/*
-	 * Check that this is DROP EXTENSION lolor
-	 */
-	if (!IsA(trigdata->parsetree, DropStmt))
-	{
-		elog(WARNING, "lo_on_drop_extension(): not a DropStmt");
-		PG_RETURN_NULL();
-	}
-	dropstmt = (DropStmt *)trigdata->parsetree;
-	if (dropstmt->removeType != OBJECT_EXTENSION)
-	{
-		elog(WARNING, "lo_on_drop_extension(): not a DropStmt for extension");
-		PG_RETURN_NULL();
-	}
-	foreach(lc, dropstmt->objects)
-	{
-		Node *objname = (Node *) lfirst(lc);
-		
-		if (strcmp(strVal(objname), "lolor") == 0)
+		newOid = GetNewObjectId();
+
+		/*
+		 * Keep the range within 1..2^28. Restart from start on overflow and see
+		 * if any of the Oids are avaialbe.
+		 */
+		newOid = newOid % (1 << MAX_OID_BITS);
+		if (newOid == 0)
+			newOid = 1;
+
+		newOid = (newOid << MAX_NODEID_BITS) | lolor_node_id;
+
+		if (IsBootstrapProcessingMode())
+			return newOid;
+
+		ScanKeyInit(&key,
+					oidcolumn,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(newOid));
+
+		/* see notes above about using SnapshotAny */
+		scan = systable_beginscan(relation, indexId, true,
+								  SnapshotAny, 1, &key);
+
+		collides = HeapTupleIsValid(systable_getnext(scan));
+
+		systable_endscan(scan);
+
+		/*
+		 * Log that we iterate more than GETNEWOID_LOG_THRESHOLD but have not
+		 * yet found OID unused in the relation. Then repeat logging with
+		 * exponentially increasing intervals until we iterate more than
+		 * GETNEWOID_LOG_MAX_INTERVAL. Finally repeat logging every
+		 * GETNEWOID_LOG_MAX_INTERVAL unless an unused OID is found. This
+		 * logic is necessary not to fill up the server log with the similar
+		 * messages.
+		 */
+		if (retries >= retries_before_log)
 		{
-			has_lolor_objs = true;
-			break;
+			ereport(LOG,
+					(errmsg("still searching for an unused OID in relation \"%s\"",
+							RelationGetRelationName(relation)),
+					 errdetail_plural("OID candidates have been checked %llu time, but no unused OID has been found yet.",
+									  "OID candidates have been checked %llu times, but no unused OID has been found yet.",
+									  retries,
+									  (unsigned long long) retries)));
+
+			/*
+			 * Double the number of retries to do before logging next until it
+			 * reaches GETNEWOID_LOG_MAX_INTERVAL.
+			 */
+			if (retries_before_log * 2 <= GETNEWOID_LOG_MAX_INTERVAL)
+				retries_before_log *= 2;
+			else
+				retries_before_log += GETNEWOID_LOG_MAX_INTERVAL;
 		}
-	}
-	if (!has_lolor_objs)
-		PG_RETURN_NULL();
+
+		retries++;
+	} while (collides);
 
 	/*
-	 * OK, this is DROP EXTENSION lolor. Rename our own
-	 * functions out of the way (they will later be dropped by the
-	 * DROP EXTENSION itself, and rename the original PostgreSQL
-	 * functions back to what they were.
+	 * If at least one log message is emitted, also log the completion of OID
+	 * assignment.
 	 */
-	SPI_connect();
+	if (retries > GETNEWOID_LOG_THRESHOLD)
+	{
+		ereport(LOG,
+				(errmsg_plural("new OID has been assigned in relation \"%s\" after %llu retry",
+							   "new OID has been assigned in relation \"%s\" after %llu retries",
+							   retries,
+							   RelationGetRelationName(relation), (unsigned long long) retries)));
+	}
 
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_open(oid, int4)"
-				" RENAME TO lo_open_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_open_orig(oid, int4)"
-				" RENAME TO lo_open", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_close(int4)"
-				" RENAME TO lo_close_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_close_orig(int4)"
-				" RENAME TO lo_close", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_creat(integer)"
-				" RENAME TO lo_creat_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_creat_orig(integer)"
-				" RENAME TO lo_creat", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_create(oid)"
-				" RENAME TO lo_create_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_create_orig(oid)"
-				" RENAME TO lo_create", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.loread(integer, integer)"
-				" RENAME TO loread_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.loread_orig(integer, integer)"
-				" RENAME TO loread", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lowrite(integer, bytea)"
-				" RENAME TO lowrite_to_drop", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lowrite_orig(integer, bytea)"
-				" RENAME TO lowrite", false, 0);
-
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_export(oid, text)"
-				" RENAME TO lo_export_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_export_orig(oid, text)"
-				" RENAME TO lo_export;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_from_bytea(oid, bytea)"
-				" RENAME TO lo_from_bytea_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_from_bytea_orig(oid, bytea)"
-				" RENAME TO lo_from_bytea;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_get(oid)"
-				" RENAME TO lo_get_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_get_orig(oid)"
-				" RENAME TO lo_get;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_get(oid, bigint, integer)"
-				" RENAME TO lo_get_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_get_orig(oid, bigint, integer)"
-				" RENAME TO lo_get;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_import(text)"
-				" RENAME TO lo_import_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_import_orig(text)"
-				" RENAME TO lo_import;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_import(text, oid)"
-				" RENAME TO lo_import_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_import_orig(text, oid)"
-				" RENAME TO lo_import;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_lseek(integer, integer, integer)"
-				" RENAME TO lo_lseek_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_lseek_orig(integer, integer, integer)"
-				" RENAME TO lo_lseek;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_lseek64(integer, bigint, integer)"
-				" RENAME TO lo_lseek64_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_lseek64_orig(integer, bigint, integer)"
-				" RENAME TO lo_lseek64;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_put(oid, bigint, bytea)"
-				" RENAME TO lo_put_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_put_orig(oid, bigint, bytea)"
-				" RENAME TO lo_put;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_tell(integer)"
-				" RENAME TO lo_tell_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_tell_orig(integer)"
-				" RENAME TO lo_tell;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_tell64(integer)"
-				" RENAME TO lo_tell64_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_tell64_orig(integer)"
-				" RENAME TO lo_tell64;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_truncate(integer, integer)"
-				" RENAME TO lo_truncate_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_truncate_orig(integer, integer)"
-				" RENAME TO lo_truncate;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_truncate64(integer, bigint)"
-				" RENAME TO lo_truncate64_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_truncate64_orig(integer, bigint)"
-				" RENAME TO lo_truncate64;", false, 0);
-
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_unlink(oid)"
-				" RENAME TO lo_unlink_to_drop;", false, 0);
-	SPI_execute("ALTER FUNCTION pg_catalog.lo_unlink_orig(oid)"
-				" RENAME TO lo_unlink;", false, 0);
-
-	SPI_finish();
-
-	PG_RETURN_NULL();
+	return newOid;
 }
