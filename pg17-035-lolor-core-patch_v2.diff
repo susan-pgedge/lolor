@@ -1,0 +1,78 @@
+diff --git a/src/backend/catalog/pg_largeobject.c b/src/backend/catalog/pg_largeobject.c
+index e235f7c5e68..ded5942992e 100644
+--- a/src/backend/catalog/pg_largeobject.c
++++ b/src/backend/catalog/pg_largeobject.c
+@@ -17,6 +17,7 @@
+ #include "access/genam.h"
+ #include "access/htup_details.h"
+ #include "access/table.h"
++#include "commands/extension.h"
+ #include "catalog/catalog.h"
+ #include "catalog/indexing.h"
+ #include "catalog/pg_largeobject.h"
+@@ -25,6 +26,7 @@
+ #include "utils/fmgroids.h"
+ #include "utils/rel.h"
+ 
++typedef Oid (*LOLOR_GetNewOidWithIndex_fn) (Relation relation, Oid indexId, AttrNumber oidcolumn);
+ 
+ /*
+  * Create a large object having the given LO identifier.
+@@ -54,9 +56,23 @@ LargeObjectCreate(Oid loid)
+ 	if (OidIsValid(loid))
+ 		loid_new = loid;
+ 	else
+-		loid_new = GetNewOidWithIndex(pg_lo_meta,
++	{
++		/* If LOLOR extension exists then use it to get new unique Oids */
++		if (OidIsValid(get_extension_oid("lolor", true)))
++		{
++			LOLOR_GetNewOidWithIndex_fn loGetNewOid;
++			loGetNewOid = (LOLOR_GetNewOidWithIndex_fn)
++				load_external_function("$libdir/lolor", "LOLOR_GetNewOidWithIndex",
++									   true, NULL);
++			loid_new = loGetNewOid(pg_lo_meta,
++									  LargeObjectMetadataOidIndexId,
++									  Anum_pg_largeobject_metadata_oid);
++		}
++		else
++			loid_new = GetNewOidWithIndex(pg_lo_meta,
+ 									  LargeObjectMetadataOidIndexId,
+ 									  Anum_pg_largeobject_metadata_oid);
++	}
+ 
+ 	values[Anum_pg_largeobject_metadata_oid - 1] = ObjectIdGetDatum(loid_new);
+ 	values[Anum_pg_largeobject_metadata_lomowner - 1]
+diff --git a/src/include/utils/rel.h b/src/include/utils/rel.h
+index 87002049538..ba2bba4da0b 100644
+--- a/src/include/utils/rel.h
++++ b/src/include/utils/rel.h
+@@ -19,6 +19,8 @@
+ #include "catalog/catalog.h"
+ #include "catalog/pg_class.h"
+ #include "catalog/pg_index.h"
++#include "catalog/pg_largeobject.h"
++#include "catalog/pg_largeobject_metadata.h"
+ #include "catalog/pg_publication.h"
+ #include "nodes/bitmapset.h"
+ #include "partitioning/partdefs.h"
+@@ -697,12 +699,18 @@ RelationCloseSmgr(Relation relation)
+  * it would complicate decoding slightly for little gain). Note that we *do*
+  * log information for user defined catalog tables since they presumably are
+  * interesting to the user...
++ *
++ * Add an exception for LargeObject catalog. The catalog entries does not
++ * rely on any information thats integral to the system and can be treated the
++ * same as user relations.
+  */
+ #define RelationIsLogicallyLogged(relation) \
+ 	(XLogLogicalInfoActive() && \
+ 	 RelationNeedsWAL(relation) && \
+ 	 (relation)->rd_rel->relkind != RELKIND_FOREIGN_TABLE &&	\
+-	 !IsCatalogRelation(relation))
++	 ((RelationGetRelid(relation) == LargeObjectRelationId ||	\
++	   RelationGetRelid(relation) == LargeObjectMetadataRelationId) ||	\
++	  !IsCatalogRelation(relation)))
+ 
+ /* routines in utils/cache/relcache.c */
+ extern void RelationIncrementReferenceCount(Relation rel);
